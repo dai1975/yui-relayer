@@ -57,6 +57,20 @@ func createClientsCmd(ctx *config.Context) *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pathName := args[0]
+
+			{ //check client id in config
+				paths, err := ctx.Config.Paths.Get(pathName)
+				if err != nil {
+					return err
+				}
+				if paths.Src != nil && paths.Src.ClientID != "" {
+					return fmt.Errorf("src client id is already set: %s", paths.Src.ClientID);
+				}
+				if paths.Dst != nil && paths.Dst.ClientID != "" {
+					return fmt.Errorf("dst client id is already set: %s", paths.Dst.ClientID);
+				}
+			}
+
 			c, src, dst, err := ctx.Config.ChainsFromPath(pathName)
 			if err != nil {
 				return err
