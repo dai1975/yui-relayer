@@ -58,19 +58,6 @@ func createClientsCmd(ctx *config.Context) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pathName := args[0]
 
-			{ //check client id in config
-				paths, err := ctx.Config.Paths.Get(pathName)
-				if err != nil {
-					return err
-				}
-				if paths.Src != nil && paths.Src.ClientID != "" {
-					return fmt.Errorf("src client id is already set: %s", paths.Src.ClientID);
-				}
-				if paths.Dst != nil && paths.Dst.ClientID != "" {
-					return fmt.Errorf("dst client id is already set: %s", paths.Dst.ClientID);
-				}
-			}
-
 			c, src, dst, err := ctx.Config.ChainsFromPath(pathName)
 			if err != nil {
 				return err
@@ -108,6 +95,34 @@ func createClientsCmd(ctx *config.Context) *cobra.Command {
 				dstHeight = clienttypes.NewHeight(latestHeight.GetRevisionNumber(), height)
 			}
 
+			srcClientId := c[src].Chain.Path().ClientID;
+			dstClientId := c[dst].Chain.Path().ClientID;
+			if srcClientId != "" && dstClientId != "" {
+				checkClient := func(pc *core.ProvableChain) error {
+					latestHeight, err := pc.LatestHeight()
+					if err != nil {
+						return err
+					}
+					queryHeight := clienttypes.NewHeight(latestHeight.GetRevisionNumber(), 0);
+					ctx := core.NewQueryContext(context.TODO(), queryHeight)
+					_, err2 := pc.QueryClientState(ctx)
+					return err2
+				}
+				if err := checkClient(c[src]); err != nil {
+					return err
+					//returne fmt.Errorf("src client id is given but cannot get state: %s", srcClientId)
+				}
+				if err := checkClient(c[dst]); err != nil {
+					return err
+				}
+				fmt.Println("client already created")
+				return nil
+
+			} else if srcClientId == "" && dstClientId != "" {
+				return fmt.Errorf("dst client id is given but src's is not.")
+			} else if srcClientId != "" && dstClientId == "" {
+				return fmt.Errorf("src client id is given but dst's is not.")
+			}
 			return core.CreateClients(pathName, c[src], c[dst], srcHeight, dstHeight)
 		},
 	}
