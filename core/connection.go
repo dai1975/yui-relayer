@@ -23,6 +23,12 @@ var (
 )
 
 func CreateConnection(pathName string, src, dst *ProvableChain, to time.Duration) error {
+	if cont, err := checkConnectionCreateReady(src, dst); err != nil {
+		return err
+	} else if !cont {
+		return nil
+	}
+
 	logger := GetConnectionPairLogger(src, dst)
 	defer logger.TimeTrack(time.Now(), "CreateConnection")
 	ticker := time.NewTicker(to)
@@ -82,6 +88,55 @@ func CreateConnection(pathName string, src, dst *ProvableChain, to time.Duration
 	}
 
 	return nil
+}
+
+func checkConnectionCreateReady(src, dst *ProvableChain) (bool, error) {
+	srcID := src.Chain.Path().ConnectionID
+	dstID := dst.Chain.Path().ConnectionID
+
+	if srcID == "" && dstID == "" {
+		return true, nil
+	}
+
+	getState := func(pc *ProvableChain) (conntypes.State, error) {
+		if pc.Chain.Path().ConnectionID == "" {
+			return conntypes.UNINITIALIZED, nil
+		}
+
+		latestHeight, err := pc.LatestHeight()
+		if err != nil {
+			return conntypes.UNINITIALIZED, err
+		}
+		queryHeight := clienttypes.NewHeight(latestHeight.GetRevisionNumber(), 0)
+		res, err2 := pc.QueryConnection(NewQueryContext(context.TODO(), queryHeight))
+		if err2 != nil {
+			return conntypes.UNINITIALIZED, err2
+		}
+		return res.Connection.State, nil
+	}
+
+	srcState, srcErr := getState(src)
+	if srcErr != nil {
+		return false, srcErr
+	}
+
+	dstState, dstErr := getState(src)
+	if dstErr != nil {
+		return false, dstErr
+	}
+
+	if srcID != "" && srcState == conntypes.UNINITIALIZED {
+		return false, fmt.Errorf("src connection id is given but that connection is not exists: %s", srcID);
+	}
+	if dstID != "" && dstState == conntypes.UNINITIALIZED {
+		return false, fmt.Errorf("dst connection id is given but that connection is not exists: %s", dstID);
+	}
+
+	if srcState == conntypes.OPEN && dstState == conntypes.OPEN {
+		fmt.Printf("connections are already created: src=%s, dst=%s\n", srcID, dstID)
+		return false, nil
+	}
+	return true, nil
 }
 
 func createConnectionStep(src, dst *ProvableChain) (*RelayMsgs, error) {
@@ -193,6 +248,7 @@ func createConnectionStep(src, dst *ProvableChain) (*RelayMsgs, error) {
 
 	// Handshake has started on src end (2 steps done), relay `connOpenAck` and `updateClient` to dst end
 	case srcConn.Connection.State == conntypes.TRYOPEN && dstConn.Connection.State == conntypes.INIT:
+		return nil,fmt.Errorf("TRYOPEN,INIT");
 		logConnectionStates(dst, src, dstConn, srcConn)
 		addr := mustGetAddress(dst)
 		if len(srcUpdateHeaders) > 0 {
@@ -202,6 +258,7 @@ func createConnectionStep(src, dst *ProvableChain) (*RelayMsgs, error) {
 
 	// Handshake has started on dst end (2 steps done), relay `connOpenAck` and `updateClient` to src end
 	case srcConn.Connection.State == conntypes.INIT && dstConn.Connection.State == conntypes.TRYOPEN:
+//		return nil,fmt.Errorf("INIT,TRYOPEN");
 		logConnectionStates(src, dst, srcConn, dstConn)
 		addr := mustGetAddress(src)
 		if len(dstUpdateHeaders) > 0 {
