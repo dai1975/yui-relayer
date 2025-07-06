@@ -220,17 +220,15 @@ func createConnectionStep(ctx context.Context, src, dst *ProvableChain) (*RelayM
 		defer close(srcStream)
 		defer close(dstStream)
 
-		srcHeight := sh.GetQueryContext(ctx, src.ChainID()).Height()
-		dstHeight := sh.GetQueryContext(ctx, dst.ChainID()).Height()
-
+		srcCtx := sh.GetQueryContext(ctx, src.ChainID())
+		dstCtx := sh.GetQueryContext(ctx, dst.ChainID())
 		eg.Go(func() error {
 			logger := &log.RelayLogger{Logger: GetConnectionPairLogger(src, dst).With(
 				"side", "src",
-				"src_height", srcHeight.String(),
-				"dst_height", dstHeight.String(),
+				"src_height", srcCtx.Height().String(),
+				"dst_height", dstCtx.Height().String(),
 			)}
-			queryCtx := sh.GetQueryContext(ctx, src.ChainID())
-			state, err := queryState(queryCtx, logger, sh, src, dst) //, doGetProof)
+			state, err := queryState(srcCtx, logger, sh, src, dst)
 			if err != nil {
 				return err
 			}
@@ -240,11 +238,10 @@ func createConnectionStep(ctx context.Context, src, dst *ProvableChain) (*RelayM
 		eg.Go(func() error {
 			logger := &log.RelayLogger{Logger: GetConnectionPairLogger(src, dst).With(
 				"side", "dst",
-				"src_height", srcHeight.String(),
-				"dst_height", dstHeight.String(),
+				"src_height", srcCtx.Height().String(),
+				"dst_height", dstCtx.Height().String(),
 			)}
-			queryCtx := sh.GetQueryContext(ctx, dst.ChainID())
-			state, err := queryState(queryCtx, logger, sh, dst, src) //, doGetProof)
+			state, err := queryState(dstCtx, logger, sh, dst, src)
 			if err != nil {
 				return err
 			}
@@ -252,12 +249,12 @@ func createConnectionStep(ctx context.Context, src, dst *ProvableChain) (*RelayM
 			return nil
 		})
 
-		err := eg.Wait() // it wait quering to other chain. it may take more time and my chain's state is deleted.
-		if err != nil {
+		var err error
+		if err = eg.Wait(); err != nil {
 			return nil, err
 		}
-		srcState, _ = <-srcStream
-		dstState, _ = <-dstStream
+		srcState = <-srcStream
+		dstState = <-dstStream
 	}
 	if !srcState.settled || !dstState.settled {
 		return out, nil
@@ -429,64 +426,6 @@ func querySettledConnection(
 		return conn, false, nil
 	}
 	return conn, true, nil
-}
-
-func querySettledConnectionPair(
-	srcCtx, dstCtx QueryContext,
-	src, dst interface {
-		Chain
-		StateProver
-	},
-	prove bool,
-) (*conntypes.QueryConnectionResponse, *conntypes.QueryConnectionResponse, bool, error) {
-	logger := GetConnectionPairLogger(src, dst)
-	logger = &log.RelayLogger{Logger: logger.With(
-		"src_height", srcCtx.Height().String(),
-		"dst_height", dstCtx.Height().String(),
-		"prove", prove,
-	)}
-
-	srcConn, dstConn, err := QueryConnectionPair(srcCtx, dstCtx, src, dst, prove)
-	if err != nil {
-		logger.ErrorContext(srcCtx.Context(), "failed to query connection pair at the latest finalized height", err)
-		return nil, nil, false, err
-	}
-
-	var srcLatestCtx, dstLatestCtx QueryContext
-	if h, err := src.LatestHeight(srcCtx.Context()); err != nil {
-		logger.ErrorContext(srcCtx.Context(), "failed to get the latest height of the src chain", err)
-		return nil, nil, false, err
-	} else {
-		srcLatestCtx = NewQueryContext(srcCtx.Context(), h)
-	}
-	if h, err := dst.LatestHeight(dstCtx.Context()); err != nil {
-		logger.ErrorContext(dstCtx.Context(), "failed to get the latest height of the dst chain", err)
-		return nil, nil, false, err
-	} else {
-		dstLatestCtx = NewQueryContext(dstCtx.Context(), h)
-	}
-
-	srcLatestConn, dstLatestConn, err := QueryConnectionPair(srcLatestCtx, dstLatestCtx, src, dst, false)
-	if err != nil {
-		logger.ErrorContext(srcCtx.Context(), "failed to query connection pair at the latest height", err)
-		return nil, nil, false, err
-	}
-
-	if srcConn.Connection.String() != srcLatestConn.Connection.String() {
-		logger.DebugContext(srcCtx.Context(), "src connection end in transition",
-			"from", srcConn.Connection.String(),
-			"to", srcLatestConn.Connection.String(),
-		)
-		return srcConn, dstConn, false, nil
-	}
-	if dstConn.Connection.String() != dstLatestConn.Connection.String() {
-		logger.DebugContext(dstCtx.Context(), "dst connection end in transition",
-			"from", dstConn.Connection.String(),
-			"to", dstLatestConn.Connection.String(),
-		)
-		return srcConn, dstConn, false, nil
-	}
-	return srcConn, dstConn, true, nil
 }
 
 func GetConnectionPairLogger(src, dst Chain) *log.RelayLogger {
