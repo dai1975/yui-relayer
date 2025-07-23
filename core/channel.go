@@ -229,39 +229,6 @@ func createChannelStep(ctx context.Context, src, dst *ProvableChain) (*RelayMsgs
 		return out, nil
 	}
 
-	/*
-		// Query a number of things all at once
-		var (
-			srcUpdateHeaders, dstUpdateHeaders []Header
-		)
-
-		err = retry.Do(func() error {
-			srcUpdateHeaders, dstUpdateHeaders, err = sh.SetupBothHeadersForUpdate(ctx, src, dst)
-			return err
-		}, rtyAtt, rtyDel, rtyErr, retry.Context(ctx), retry.OnRetry(func(n uint, err error) {
-			// logRetryUpdateHeaders(src, dst, n, err)
-			if err := sh.Updates(ctx, src, dst); err != nil {
-				panic(err)
-			}
-		}))
-
-		if err != nil {
-			return nil, err
-		}
-
-		srcChan, dstChan, settled, err := querySettledChannelPair(
-			sh.GetQueryContext(ctx, src.ChainID()),
-			sh.GetQueryContext(ctx, dst.ChainID()),
-			src,
-			dst,
-			true,
-		)
-		if err != nil {
-			return nil, err
-		} else if !settled {
-			return out, nil
-		}
-	*/
 	switch {
 	// Handshake hasn't been started on src or dst, relay `chanOpenInit` to src
 	case srcState.channel.Channel.State == chantypes.UNINITIALIZED && dstState.channel.Channel.State == chantypes.UNINITIALIZED:
