@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cometbft/cometbft/light"
@@ -120,6 +123,23 @@ func (pr *Prover) SetupHeadersForUpdate(ctx context.Context, counterparty core.F
 	valSet, err := self.QueryValsetAtHeight(ctx, h.TrustedHeight)
 	if err != nil {
 		return nil, err
+	}
+
+	if val, ok := os.LookupEnv("DEBUG_RELAYER_WAIT"); ok {
+		s := strings.Split(val, " ")
+		if s[0] == counterparty.ChainID() {
+			t, _ := strconv.Atoi(s[1])
+			n := t / 60
+			for i := 0; i <= n; i++ {
+				fmt.Printf(">DEBUG_RELAYER_WAIT: %s %v/%v\n", s[0], (i+1)*60, t)
+				time.Sleep(time.Duration(n) * time.Second)
+			}
+			fmt.Printf("<DEBUG_RELAYER_WAIT: %s %v\n", s[0], t)
+		} else {
+			fmt.Printf("DEBUG_RELAYER_WAIT(%v) is not a counterparty(%v)\n", s[0], counterparty.ChainID())
+		}
+	} else {
+		fmt.Printf("DEBUG_RELAYER_WAIT is not set\n")
 	}
 
 	// inject TrustedValidators into header

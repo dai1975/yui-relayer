@@ -134,44 +134,47 @@ func checkChannelCreateReady(ctx context.Context, src, dst *ProvableChain, logge
 	return true, nil
 }
 
+type queryCreateChannelStateResult struct {
+	updateHeaders []Header
+	channel       *chantypes.QueryChannelResponse
+	settled       bool
+}
+func queryCreateChannelState(queryCtx QueryContext, logger *log.RelayLogger, sh SyncHeaders, prover, counterparty *ProvableChain) (*queryCreateChannelStateResult, error) {
+	var ret queryCreateChannelStateResult
+	err := retry.Do(func() error {
+		var err error
+		ret.updateHeaders, err = sh.SetupHeadersForUpdate(queryCtx.Context(), prover, counterparty)
+		if err != nil {
+			return err
+		}
+		return nil
+	}, rtyAtt, rtyDel, rtyErr, retry.Context(queryCtx.Context()), retry.OnRetry(func(n uint, err error) {
+		// logRetryUpdateHeaders(src, dst, n, err)
+		if err := sh.Updates(queryCtx.Context(), prover, counterparty); err != nil {
+			panic(err)
+		}
+	}))
+	if err != nil {
+		return nil, err
+	}
+
+	ret.channel, ret.settled, err = querySettledChannel(queryCtx, logger, prover, true)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ret, nil
+}
+
 func createChannelStep(ctx context.Context, src, dst *ProvableChain) (*RelayMsgs, error) {
 	fmt.Printf("-->createChannelStep: src=%s, dst=%s\n", src.ChainID(), dst.ChainID())
 	out := NewRelayMsgs()
 	if err := validatePaths(src, dst); err != nil {
 		return nil, err
 	}
-	type queryStateResult struct {
-		updateHeaders []Header
-		channel       *chantypes.QueryChannelResponse
-		settled       bool
-	}
-	queryState := func(queryCtx QueryContext, logger *log.RelayLogger, sh SyncHeaders, prover, counterparty *ProvableChain) (*queryStateResult, error) {
-		var ret queryStateResult
-		err := retry.Do(func() error {
-			var err error
-			ret.updateHeaders, err = sh.SetupHeadersForUpdate(queryCtx.Context(), prover, counterparty)
-			if err != nil {
-				return err
-			}
-			ret.channel, ret.settled, err = querySettledChannel(queryCtx, logger, prover, true)
-			if err != nil {
-				return err
-			}
-			return nil
-		}, rtyAtt, rtyDel, rtyErr, retry.Context(ctx), retry.OnRetry(func(n uint, err error) {
-			// logRetryUpdateHeaders(src, dst, n, err)
-			if err := sh.Updates(ctx, src, dst); err != nil {
-				panic(err)
-			}
-		}))
-		if err != nil {
-			return nil, err
-		}
-		return &ret, nil
-	}
 
 	var (
-		srcState, dstState *queryStateResult
+		srcState, dstState *queryCreateChannelStateResult
 	)
 
 	// First, update the light clients to the latest header and return the header
@@ -182,8 +185,8 @@ func createChannelStep(ctx context.Context, src, dst *ProvableChain) (*RelayMsgs
 
 	{
 		var eg = new(errgroup.Group)
-		srcStream := make(chan *queryStateResult, 1)
-		dstStream := make(chan *queryStateResult, 1)
+		srcStream := make(chan *queryCreateChannelStateResult, 1)
+		dstStream := make(chan *queryCreateChannelStateResult, 1)
 		defer close(srcStream)
 		defer close(dstStream)
 
@@ -195,7 +198,7 @@ func createChannelStep(ctx context.Context, src, dst *ProvableChain) (*RelayMsgs
 				"src_height", srcCtx.Height().String(),
 				"dst_height", dstCtx.Height().String(),
 			)}
-			state, err := queryState(srcCtx, logger, sh, src, dst)
+			state, err := queryCreateChannelState(srcCtx, logger, sh, src, dst)
 			if err != nil {
 				return err
 			}
@@ -208,7 +211,7 @@ func createChannelStep(ctx context.Context, src, dst *ProvableChain) (*RelayMsgs
 				"src_height", srcCtx.Height().String(),
 				"dst_height", dstCtx.Height().String(),
 			)}
-			state, err := queryState(dstCtx, logger, sh, dst, src)
+			state, err := queryCreateChannelState(dstCtx, logger, sh, dst, src)
 			if err != nil {
 				return err
 			}
@@ -402,7 +405,7 @@ func querySettledChannelPair(
 	if err != nil {
 		return nil, nil, false, err
 	}
-	return srcChan, dstChan, (srcSettled || dstSettled), nil
+	return srcChan, dstChan, (srcSettled && dstSettled), nil
 }
 
 func GetChannelLogger(c Chain) *log.RelayLogger {

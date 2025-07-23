@@ -143,7 +143,7 @@ func checkConnectionCreateReady(ctx context.Context, src, dst *ProvableChain, lo
 	return true, nil
 }
 
-type queryStateResult struct {
+type queryCreateConnectionStateResult struct {
 	updateHeaders []Header
 	conn          *conntypes.QueryConnectionResponse
 	settled       bool
@@ -154,8 +154,8 @@ type queryStateResult struct {
 	consH         ibcexported.Height
 }
 
-func queryState(ctx QueryContext, logger *log.RelayLogger, sh SyncHeaders, prover, counterparty *ProvableChain) (*queryStateResult, error) {
-	var ret queryStateResult
+func queryCreateConnectionState(ctx QueryContext, logger *log.RelayLogger, sh SyncHeaders, prover, counterparty *ProvableChain) (*queryCreateConnectionStateResult, error) {
+	var ret queryCreateConnectionStateResult
 	var err error
 
 	ret.updateHeaders, err = sh.SetupHeadersForUpdate(ctx.Context(), prover, counterparty)
@@ -205,7 +205,7 @@ func createConnectionStep(ctx context.Context, src, dst *ProvableChain) (*RelayM
 	}
 	// Query a number of things all at once
 	var (
-		srcState, dstState                 *queryStateResult
+		srcState, dstState                 *queryCreateConnectionStateResult
 		srcHostConsProof, dstHostConsProof []byte
 	)
 
@@ -215,8 +215,8 @@ func createConnectionStep(ctx context.Context, src, dst *ProvableChain) (*RelayM
 
 	{
 		var eg = new(errgroup.Group)
-		srcStream := make(chan *queryStateResult, 1)
-		dstStream := make(chan *queryStateResult, 1)
+		srcStream := make(chan *queryCreateConnectionStateResult, 1)
+		dstStream := make(chan *queryCreateConnectionStateResult, 1)
 		defer close(srcStream)
 		defer close(dstStream)
 
@@ -228,7 +228,7 @@ func createConnectionStep(ctx context.Context, src, dst *ProvableChain) (*RelayM
 				"src_height", srcCtx.Height().String(),
 				"dst_height", dstCtx.Height().String(),
 			)}
-			state, err := queryState(srcCtx, logger, sh, src, dst)
+			state, err := queryCreateConnectionState(srcCtx, logger, sh, src, dst)
 			if err != nil {
 				return err
 			}
@@ -241,7 +241,7 @@ func createConnectionStep(ctx context.Context, src, dst *ProvableChain) (*RelayM
 				"src_height", srcCtx.Height().String(),
 				"dst_height", dstCtx.Height().String(),
 			)}
-			state, err := queryState(dstCtx, logger, sh, dst, src)
+			state, err := queryCreateConnectionState(dstCtx, logger, sh, dst, src)
 			if err != nil {
 				return err
 			}
