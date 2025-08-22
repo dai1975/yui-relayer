@@ -231,56 +231,53 @@ func QueryChannelPair(
 	return
 }
 
+func QueryChannelUpgrade(queryCtx QueryContext, chain interface {
+	Chain
+	StateProver
+}, prove bool) (*chantypes.QueryUpgradeResponse, error) {
+	chanUpg, err := chain.QueryChannelUpgrade(queryCtx)
+	if err != nil {
+		return nil, err
+	} else if chanUpg == nil {
+		return nil, nil
+	}
+
+	if !prove {
+		return chanUpg, nil
+	}
+
+	if value, err := chain.Codec().Marshal(&chanUpg.Upgrade); err != nil {
+		return nil, err
+	} else {
+		path := host.ChannelUpgradePath(chain.Path().PortID, chain.Path().ChannelID)
+		chanUpg.Proof, chanUpg.ProofHeight, err = chain.ProveState(queryCtx, path, value)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return chanUpg, nil
+}
+
 func QueryChannelUpgradePair(srcCtx, dstCtx QueryContext, src, dst interface {
 	Chain
 	StateProver
 }, prove bool) (srcChanUpg, dstChanUpg *chantypes.QueryUpgradeResponse, err error) {
 	eg := new(errgroup.Group)
 
-	// get channel upgrade from src chain
 	eg.Go(func() error {
 		var err error
-		srcChanUpg, err = src.QueryChannelUpgrade(srcCtx)
+		srcChanUpg, err = QueryChannelUpgrade(srcCtx, src, prove)
 		if err != nil {
 			return err
-		} else if srcChanUpg == nil {
-			return nil
 		}
-
-		if !prove {
-			return nil
-		}
-
-		if value, err := src.Codec().Marshal(&srcChanUpg.Upgrade); err != nil {
-			return err
-		} else {
-			path := host.ChannelUpgradePath(src.Path().PortID, src.Path().ChannelID)
-			srcChanUpg.Proof, srcChanUpg.ProofHeight, err = src.ProveState(srcCtx, path, value)
-			return err
-		}
+		return nil
 	})
-
-	// get channel upgrade from dst chain
 	eg.Go(func() error {
-		var err error
-		dstChanUpg, err = dst.QueryChannelUpgrade(dstCtx)
+		dstChanUpg, err = QueryChannelUpgrade(dstCtx, dst, prove)
 		if err != nil {
 			return err
-		} else if dstChanUpg == nil {
-			return nil
 		}
-
-		if !prove {
-			return nil
-		}
-
-		if value, err := dst.Codec().Marshal(&dstChanUpg.Upgrade); err != nil {
-			return err
-		} else {
-			path := host.ChannelUpgradePath(dst.Path().PortID, dst.Path().ChannelID)
-			dstChanUpg.Proof, dstChanUpg.ProofHeight, err = dst.ProveState(dstCtx, path, value)
-			return err
-		}
+		return nil
 	})
 	err = eg.Wait()
 	return
@@ -289,7 +286,7 @@ func QueryChannelUpgradePair(srcCtx, dstCtx QueryContext, src, dst interface {
 func QueryChannelUpgradeError(ctx QueryContext, chain interface {
 	Chain
 	StateProver
-}, prove bool) (*chantypes.QueryUpgradeErrorResponse, error) {
+}, prove bool,	defaultUpgErr *chantypes.QueryUpgradeErrorResponse) (*chantypes.QueryUpgradeErrorResponse, error) {
 	if chanUpgErr, err := chain.QueryChannelUpgradeError(ctx); err != nil {
 		return nil, err
 	} else if chanUpgErr == nil {
@@ -298,6 +295,11 @@ func QueryChannelUpgradeError(ctx QueryContext, chain interface {
 		return chanUpgErr, nil
 	} else if value, err := chain.Codec().Marshal(&chanUpgErr.ErrorReceipt); err != nil {
 		return nil, err
+	} else if defaultUpgErr != nil {
+		chanUpgErr.Proof = defaultUpgErr.Proof
+		chanUpgErr.ProofHeight = defaultUpgErr.ProofHeight
+		chanUpgErr.ErrorReceipt = defaultUpgErr.ErrorReceipt
+		return chanUpgErr, nil
 	} else {
 		path := host.ChannelUpgradeErrorPath(chain.Path().PortID, chain.Path().ChannelID)
 		chanUpgErr.Proof, chanUpgErr.ProofHeight, err = chain.ProveState(ctx, path, value)

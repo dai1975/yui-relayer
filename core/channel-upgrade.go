@@ -11,8 +11,10 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	clienttypes "github.com/cosmos/ibc-go/v8/modules/core/02-client/types"
 	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
+	host "github.com/cosmos/ibc-go/v8/modules/core/24-host"
 	"github.com/hyperledger-labs/yui-relayer/log"
 	"go.opentelemetry.io/otel/codes"
+	"golang.org/x/sync/errgroup"
 )
 
 type UpgradeState int
@@ -234,7 +236,7 @@ func CancelChannelUpgrade(ctx context.Context, chain, cp *ProvableChain, settlem
 			return false, err
 		}
 
-		upgErr, err := QueryChannelUpgradeError(cpQueryCtx, cp, true)
+		upgErr, err := QueryChannelUpgradeError(cpQueryCtx, cp, true, nil)
 		if err != nil {
 			logger.ErrorContext(ctx, "failed to query the channel upgrade error receipt", err)
 			return false, err
@@ -303,6 +305,82 @@ func NewUpgradeState(chanState chantypes.State, upgradeExists bool) (UpgradeStat
 	}
 }
 
+type queryUpgradeChannelStateResult struct {
+	updateHeaders        []Header
+	channel              *chantypes.QueryChannelResponse
+	chanUpg              *chantypes.QueryUpgradeResponse
+	settled              bool
+	upgradeState         UpgradeState
+	proposedConnectionID string
+	defaultUpgErr    chantypes.QueryUpgradeErrorResponse
+}
+
+func queryUpgradeChannelState(ctx context.Context, sh SyncHeaders, prover, counterparty *ProvableChain) (*queryUpgradeChannelStateResult, error) {
+	var ret queryUpgradeChannelStateResult
+	logger := GetChannelPairLoggerRelative(prover, counterparty)
+	queryCtx := sh.GetQueryContext(ctx, prover.ChainID())
+
+	var err error
+	ret.updateHeaders, err = sh.SetupHeadersForUpdate(ctx, prover, counterparty)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to set up headers for LC update", err)
+		return nil, err
+	}
+
+	ret.channel, ret.settled, err = querySettledChannel(queryCtx, logger, prover, true)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to query the channel with proof", err)
+		return nil, err
+	} else if !ret.settled {
+		return &ret, nil
+	}
+
+	ret.chanUpg, ret.settled, err = querySettledChannelUpgrade(queryCtx, logger, prover, true)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to query the channel upgrade with proof", err)
+		return nil, err
+	} else if !ret.settled {
+		return &ret, nil
+	}
+
+	ret.upgradeState, err = NewUpgradeState(ret.channel.Channel.State, ret.chanUpg != nil)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to create UpgradeState", err)
+		return nil, err
+	}
+
+	/**
+	 * proposedConnectionID is used only if
+	 * - counterparty's action is UPGRADE_ACTION_TRY, it is only if  my upgradeState is UPGRADE_STATE_INIT
+	 * - call upgradeAlreadyComplete, it is only if my upgradeState is UPGRADE_STATE_FLUSHCOMPLETE
+	 */
+	if ret.upgradeState == UPGRADE_STATE_INIT || ret.upgradeState == UPGRADE_STATE_FLUSHCOMPLETE {
+		ret.proposedConnectionID, err = queryProposedConnectionID(queryCtx, prover, ret.chanUpg)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	/**
+	 * upgErr is used only if
+	 * - counterparty's actions is UPGRADE_ACTION_CANCEL or UPGRADE_ACTION_CANCEL_FLUSHCOMPLETE
+	 * - my upgradeState is UPGRADE_STATE_UNINIT or UPGRADE_STATE_INIT
+	 */
+	if ret.upgradeState == UPGRADE_STATE_UNINIT || ret.upgradeState == UPGRADE_STATE_INIT {
+		path := host.ChannelUpgradeErrorPath(prover.Path().PortID, prover.Path().ChannelID)
+		value := []byte{}
+		proof, proofHeight, err := prover.ProveState(queryCtx, path, value)
+		if err != nil {
+			return nil, err
+		}
+		ret.defaultUpgErr.Proof = proof
+		ret.defaultUpgErr.ProofHeight = proofHeight
+		ret.defaultUpgErr.ErrorReceipt = TODO;
+	}
+
+	return &ret, nil
+}
+
 func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcState, targetDstState UpgradeState, firstCall bool) (*RelayMsgs, error) {
 	logger := GetChannelPairLogger(src, dst)
 	logger = &log.RelayLogger{Logger: logger.With("first_call", firstCall)}
@@ -322,57 +400,44 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 	}
 
 	// Query a number of things all at once
-	var srcUpdateHeaders, dstUpdateHeaders []Header
+	var srcResult, dstResult *queryUpgradeChannelStateResult
 	if err := retry.Do(func() error {
-		srcUpdateHeaders, dstUpdateHeaders, err = sh.SetupBothHeadersForUpdate(ctx, src, dst)
-		return err
-	}, rtyAtt, rtyDel, rtyErr, retry.Context(ctx), retry.OnRetry(func(uint, error) {
+		var eg = new(errgroup.Group)
+
+		eg.Go(func() error {
+			state, err := queryUpgradeChannelState(ctx, sh, src, dst)
+			if err != nil {
+				return err
+			}
+			srcResult = state
+			return nil
+		})
+		eg.Go(func() error {
+			state, err := queryUpgradeChannelState(ctx, sh, dst, src)
+			if err != nil {
+				return err
+			}
+			dstResult = state
+			return nil
+		})
+		if err = eg.Wait(); err != nil {
+			return err
+		}
+		return nil
+	}, rtyAtt, rtyDel, rtyErr, retry.Context(ctx), retry.OnRetry(func(n uint, err error) {
 		if err := sh.Updates(ctx, src, dst); err != nil {
 			panic(err)
 		}
 	})); err != nil {
-		logger.ErrorContext(ctx, "failed to set up headers for LC update on both chains", err)
 		return nil, err
 	}
 
-	srcCtx := sh.GetQueryContext(ctx, src.ChainID())
-	dstCtx := sh.GetQueryContext(ctx, dst.ChainID())
-
-	// query finalized channels with proofs
-	srcChan, dstChan, settled, err := querySettledChannelPair(srcCtx, dstCtx, src, dst, true)
-	if err != nil {
-		logger.ErrorContext(ctx, "failed to query the channel pair with proofs", err)
-		return nil, err
-	} else if !settled {
+	if !srcResult.settled || !dstResult.settled {
 		return out, nil
 	}
 
-	// query finalized channel upgrades with proofs
-	srcChanUpg, dstChanUpg, settled, err := querySettledChannelUpgradePair(
-		srcCtx,
-		dstCtx,
-		src,
-		dst,
-		true,
-	)
-	if err != nil {
-		logger.ErrorContext(ctx, "failed to query the channel upgrade pair with proofs", err)
-		return nil, err
-	} else if !settled {
-		return out, nil
-	}
-
-	// determine upgrade states
-	srcState, err := NewUpgradeState(srcChan.Channel.State, srcChanUpg != nil)
-	if err != nil {
-		logger.ErrorContext(ctx, "failed to create UpgradeState of the src chain", err)
-		return nil, err
-	}
-	dstState, err := NewUpgradeState(dstChan.Channel.State, dstChanUpg != nil)
-	if err != nil {
-		logger.ErrorContext(ctx, "failed to create UpgradeState of the dst chain", err)
-		return nil, err
-	}
+	srcState := srcResult.upgradeState
+	dstState := dstResult.upgradeState
 
 	logger = &log.RelayLogger{Logger: logger.With(
 		slog.Group("current_channel_upgrade_states",
@@ -380,6 +445,9 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 			"dst", dstState.String(),
 		),
 	)}
+
+	srcCtx := sh.GetQueryContext(ctx, src.ChainID())
+	dstCtx := sh.GetQueryContext(ctx, dst.ChainID())
 
 	// check if both chains have reached the target states or UNINIT states
 	if !firstCall && srcState == UPGRADE_STATE_UNINIT && dstState == UPGRADE_STATE_UNINIT ||
@@ -396,13 +464,13 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 	case srcState == UPGRADE_STATE_UNINIT && dstState == UPGRADE_STATE_UNINIT:
 		return nil, errors.New("channel upgrade is not initialized")
 	case srcState == UPGRADE_STATE_INIT && dstState == UPGRADE_STATE_UNINIT:
-		if dstChan.Channel.UpgradeSequence >= srcChan.Channel.UpgradeSequence {
+		if dstResult.channel.Channel.UpgradeSequence >= srcResult.channel.Channel.UpgradeSequence {
 			srcAction = UPGRADE_ACTION_CANCEL
 		} else {
 			dstAction = UPGRADE_ACTION_TRY
 		}
 	case srcState == UPGRADE_STATE_UNINIT && dstState == UPGRADE_STATE_INIT:
-		if srcChan.Channel.UpgradeSequence >= dstChan.Channel.UpgradeSequence {
+		if srcResult.channel.Channel.UpgradeSequence >= dstResult.channel.Channel.UpgradeSequence {
 			dstAction = UPGRADE_ACTION_CANCEL
 		} else {
 			srcAction = UPGRADE_ACTION_TRY
@@ -412,12 +480,12 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 	case srcState == UPGRADE_STATE_FLUSHING && dstState == UPGRADE_STATE_UNINIT:
 		srcAction = UPGRADE_ACTION_CANCEL
 	case srcState == UPGRADE_STATE_UNINIT && dstState == UPGRADE_STATE_FLUSHCOMPLETE:
-		if complete, err := upgradeAlreadyComplete(srcChan, dstCtx, dst, dstChanUpg); err != nil {
+		if complete, err := upgradeAlreadyComplete(srcResult.channel, dstResult.chanUpg, dstResult.proposedConnectionID); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the src side has already completed", err)
 			return nil, err
 		} else if complete {
 			dstAction = UPGRADE_ACTION_OPEN
-		} else if timedout, err := upgradeAlreadyTimedOut(srcCtx, src, dstChanUpg); err != nil {
+		} else if timedout, err := upgradeAlreadyTimedOut(srcCtx, src, dstResult.chanUpg); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the src side has already timed out", err)
 			return nil, err
 		} else if timedout {
@@ -426,12 +494,12 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 			dstAction = UPGRADE_ACTION_CANCEL_FLUSHCOMPLETE
 		}
 	case srcState == UPGRADE_STATE_FLUSHCOMPLETE && dstState == UPGRADE_STATE_UNINIT:
-		if complete, err := upgradeAlreadyComplete(dstChan, srcCtx, src, srcChanUpg); err != nil {
+		if complete, err := upgradeAlreadyComplete(dstResult.channel, srcResult.chanUpg, srcResult.proposedConnectionID); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the dst side has already completed", err)
 			return nil, err
 		} else if complete {
 			srcAction = UPGRADE_ACTION_OPEN
-		} else if timedout, err := upgradeAlreadyTimedOut(dstCtx, dst, srcChanUpg); err != nil {
+		} else if timedout, err := upgradeAlreadyTimedOut(dstCtx, dst, srcResult.chanUpg); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the dst side has already timed out", err)
 			return nil, err
 		} else if timedout {
@@ -442,14 +510,14 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 	case srcState == UPGRADE_STATE_INIT && dstState == UPGRADE_STATE_INIT: // crossing hellos
 		// it is intentional to execute chanUpgradeTry on both sides if upgrade sequences
 		// are identical to each other. this is for testing purpose.
-		if srcChan.Channel.UpgradeSequence >= dstChan.Channel.UpgradeSequence {
+		if srcResult.channel.Channel.UpgradeSequence >= dstResult.channel.Channel.UpgradeSequence {
 			dstAction = UPGRADE_ACTION_TRY
 		}
-		if srcChan.Channel.UpgradeSequence <= dstChan.Channel.UpgradeSequence {
+		if srcResult.channel.Channel.UpgradeSequence <= dstResult.channel.Channel.UpgradeSequence {
 			srcAction = UPGRADE_ACTION_TRY
 		}
 	case srcState == UPGRADE_STATE_INIT && dstState == UPGRADE_STATE_FLUSHING:
-		if srcChan.Channel.UpgradeSequence != dstChan.Channel.UpgradeSequence {
+		if srcResult.channel.Channel.UpgradeSequence != dstResult.channel.Channel.UpgradeSequence {
 			dstAction = UPGRADE_ACTION_CANCEL
 		} else {
 			// chanUpgradeAck checks if counterparty-specified timeout has exceeded.
@@ -458,7 +526,7 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 			srcAction = UPGRADE_ACTION_ACK
 		}
 	case srcState == UPGRADE_STATE_FLUSHING && dstState == UPGRADE_STATE_INIT:
-		if srcChan.Channel.UpgradeSequence != dstChan.Channel.UpgradeSequence {
+		if srcResult.channel.Channel.UpgradeSequence != dstResult.channel.Channel.UpgradeSequence {
 			srcAction = UPGRADE_ACTION_CANCEL
 		} else {
 			// chanUpgradeAck checks if counterparty-specified timeout has exceeded.
@@ -467,12 +535,12 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 			dstAction = UPGRADE_ACTION_ACK
 		}
 	case srcState == UPGRADE_STATE_INIT && dstState == UPGRADE_STATE_FLUSHCOMPLETE:
-		if complete, err := upgradeAlreadyComplete(srcChan, dstCtx, dst, dstChanUpg); err != nil {
+		if complete, err := upgradeAlreadyComplete(srcResult.channel, dstResult.chanUpg, dstResult.proposedConnectionID); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the src side has already completed", err)
 			return nil, err
 		} else if complete {
 			dstAction = UPGRADE_ACTION_OPEN
-		} else if timedout, err := upgradeAlreadyTimedOut(srcCtx, src, dstChanUpg); err != nil {
+		} else if timedout, err := upgradeAlreadyTimedOut(srcCtx, src, dstResult.chanUpg); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the src side has already timed out", err)
 			return nil, err
 		} else if timedout {
@@ -481,12 +549,12 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 			dstAction = UPGRADE_ACTION_CANCEL_FLUSHCOMPLETE
 		}
 	case srcState == UPGRADE_STATE_FLUSHCOMPLETE && dstState == UPGRADE_STATE_INIT:
-		if complete, err := upgradeAlreadyComplete(dstChan, srcCtx, src, srcChanUpg); err != nil {
+		if complete, err := upgradeAlreadyComplete(dstResult.channel, srcResult.chanUpg, srcResult.proposedConnectionID); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the dst side has already completed", err)
 			return nil, err
 		} else if complete {
 			srcAction = UPGRADE_ACTION_OPEN
-		} else if timedout, err := upgradeAlreadyTimedOut(dstCtx, dst, srcChanUpg); err != nil {
+		} else if timedout, err := upgradeAlreadyTimedOut(dstCtx, dst, srcResult.chanUpg); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the dst side has already timed out", err)
 			return nil, err
 		} else if timedout {
@@ -495,13 +563,13 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 			srcAction = UPGRADE_ACTION_CANCEL_FLUSHCOMPLETE
 		}
 	case srcState == UPGRADE_STATE_FLUSHING && dstState == UPGRADE_STATE_FLUSHING:
-		if timedout, err := upgradeAlreadyTimedOut(srcCtx, src, dstChanUpg); err != nil {
+		if timedout, err := upgradeAlreadyTimedOut(srcCtx, src, dstResult.chanUpg); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the src side has already timed out", err)
 			return nil, err
 		} else if timedout {
 			dstAction = UPGRADE_ACTION_TIMEOUT
 		}
-		if timedout, err := upgradeAlreadyTimedOut(dstCtx, dst, srcChanUpg); err != nil {
+		if timedout, err := upgradeAlreadyTimedOut(dstCtx, dst, srcResult.chanUpg); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the dst side has already timed out", err)
 			return nil, err
 		} else if timedout {
@@ -526,7 +594,7 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 			dstAction = UPGRADE_ACTION_CONFIRM
 		}
 	case srcState == UPGRADE_STATE_FLUSHING && dstState == UPGRADE_STATE_FLUSHCOMPLETE:
-		if timedout, err := upgradeAlreadyTimedOut(srcCtx, src, dstChanUpg); err != nil {
+		if timedout, err := upgradeAlreadyTimedOut(srcCtx, src, dstResult.chanUpg); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the src side has already timed out", err)
 			return nil, err
 		} else if timedout {
@@ -538,7 +606,7 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 			srcAction = UPGRADE_ACTION_CONFIRM
 		}
 	case srcState == UPGRADE_STATE_FLUSHCOMPLETE && dstState == UPGRADE_STATE_FLUSHING:
-		if timedout, err := upgradeAlreadyTimedOut(dstCtx, dst, srcChanUpg); err != nil {
+		if timedout, err := upgradeAlreadyTimedOut(dstCtx, dst, srcResult.chanUpg); err != nil {
 			logger.ErrorContext(ctx, "failed to check if the upgrade on the dst side has already timed out", err)
 			return nil, err
 		} else if timedout {
@@ -566,19 +634,21 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 	if srcAction != UPGRADE_ACTION_NONE {
 		addr := mustGetAddress(src)
 
-		if len(dstUpdateHeaders) > 0 {
-			out.Src = append(out.Src, src.Path().UpdateClients(dstUpdateHeaders, addr)...)
+		if len(dstResult.updateHeaders) > 0 {
+			out.Src = append(out.Src, src.Path().UpdateClients(dstResult.updateHeaders, addr)...)
 		}
 
 		msg, err := buildActionMsg(
 			src,
 			srcAction,
-			srcChan,
+			srcResult.channel,
 			addr,
 			dstCtx,
 			dst,
-			dstChan,
-			dstChanUpg,
+			dstResult.channel,
+			dstResult.chanUpg,
+			dstResult.proposedConnectionID,
+			&dstResult.defaultUpgErr,
 		)
 		if err != nil {
 			logger.ErrorContext(ctx, "failed to build Msg for the src chain", err)
@@ -591,19 +661,21 @@ func upgradeChannelStep(ctx context.Context, src, dst *ProvableChain, targetSrcS
 	if dstAction != UPGRADE_ACTION_NONE {
 		addr := mustGetAddress(dst)
 
-		if len(srcUpdateHeaders) > 0 {
-			out.Dst = append(out.Dst, dst.Path().UpdateClients(srcUpdateHeaders, addr)...)
+		if len(srcResult.updateHeaders) > 0 {
+			out.Dst = append(out.Dst, dst.Path().UpdateClients(srcResult.updateHeaders, addr)...)
 		}
 
 		msg, err := buildActionMsg(
 			dst,
 			dstAction,
-			dstChan,
+			dstResult.channel,
 			addr,
 			srcCtx,
 			src,
-			srcChan,
-			srcChanUpg,
+			srcResult.channel,
+			srcResult.chanUpg,
+			srcResult.proposedConnectionID,
+			&srcResult.defaultUpgErr,
 		)
 		if err != nil {
 			logger.ErrorContext(ctx, "failed to build Msg for the dst chain", err)
@@ -639,6 +711,50 @@ func queryCanTransitionToFlushComplete(ctx context.Context, chain interface {
 	}
 }
 
+func querySettledChannelUpgrade(
+	queryCtx QueryContext,
+	logger *log.RelayLogger,
+	chain interface {
+		Chain
+		StateProver
+	},
+	prove bool,
+) (*chantypes.QueryUpgradeResponse, bool, error) {
+	logger = &log.RelayLogger{Logger: logger.With(
+		"prove", prove,
+	)}
+
+	// query channel upgrade pair at latest finalized heights
+	chanUpg, err := QueryChannelUpgrade(queryCtx, chain, prove)
+	if err != nil {
+		logger.ErrorContext(queryCtx.Context(), "failed to query a channel upgrade at the latest finalized heights", err)
+		return nil, false, err
+	}
+
+	// prepare QueryContext's based on the latest heights
+	var latestCtx QueryContext
+	if h, err := chain.LatestHeight(queryCtx.Context()); err != nil {
+		logger.ErrorContext(queryCtx.Context(), "failed to get the latest height", err)
+		return nil, false, err
+	} else {
+		latestCtx = NewQueryContext(queryCtx.Context(), h)
+	}
+
+	// query channel upgrade pair at latest heights
+	latestChanUpg, err := QueryChannelUpgrade(latestCtx, chain, false)
+	if err != nil {
+		logger.ErrorContext(queryCtx.Context(), "failed to query a channel upgrade at the latest heights", err)
+		return nil, false, err
+	}
+
+	if !compareUpgrades(chanUpg, latestChanUpg) {
+		logger.DebugContext(queryCtx.Context(), "channel upgrade in transition")
+		return chanUpg, false, nil
+	}
+
+	return chanUpg, true, nil
+}
+
 func querySettledChannelUpgradePair(
 	srcCtx, dstCtx QueryContext,
 	src, dst interface {
@@ -654,45 +770,15 @@ func querySettledChannelUpgradePair(
 		"prove", prove,
 	)}
 
-	// query channel upgrade pair at latest finalized heights
-	srcChanUpg, dstChanUpg, err := QueryChannelUpgradePair(srcCtx, dstCtx, src, dst, prove)
+	srcRes, srcSettled, err := querySettledChannelUpgrade(srcCtx, logger, src, prove)
 	if err != nil {
-		logger.ErrorContext(srcCtx.Context(), "failed to query a channel upgrade pair at the latest finalized heights", err)
 		return nil, nil, false, err
 	}
-
-	// prepare QueryContext's based on the latest heights
-	var srcLatestCtx, dstLatestCtx QueryContext
-	if h, err := src.LatestHeight(srcCtx.Context()); err != nil {
-		logger.ErrorContext(srcCtx.Context(), "failed to get the latest height of the src chain", err)
-		return nil, nil, false, err
-	} else {
-		srcLatestCtx = NewQueryContext(srcCtx.Context(), h)
-	}
-	if h, err := dst.LatestHeight(dstCtx.Context()); err != nil {
-		logger.ErrorContext(dstCtx.Context(), "failed to get the latest height of the dst chain", err)
-		return nil, nil, false, err
-	} else {
-		dstLatestCtx = NewQueryContext(dstCtx.Context(), h)
-	}
-
-	// query channel upgrade pair at latest heights
-	srcLatestChanUpg, dstLatestChanUpg, err := QueryChannelUpgradePair(srcLatestCtx, dstLatestCtx, src, dst, false)
+	dstRes, dstSettled, err := querySettledChannelUpgrade(dstCtx, logger, dst, prove)
 	if err != nil {
-		logger.ErrorContext(srcCtx.Context(), "failed to query a channel upgrade pair at the latest heights", err)
 		return nil, nil, false, err
 	}
-
-	if !compareUpgrades(srcChanUpg, srcLatestChanUpg) {
-		logger.DebugContext(srcCtx.Context(), "src channel upgrade in transition")
-		return srcChanUpg, dstChanUpg, false, nil
-	}
-	if !compareUpgrades(dstChanUpg, dstLatestChanUpg) {
-		logger.DebugContext(dstCtx.Context(), "dst channel upgrade in transition")
-		return srcChanUpg, dstChanUpg, false, nil
-	}
-
-	return srcChanUpg, dstChanUpg, true, nil
+	return srcRes, dstRes, (srcSettled && dstSettled), nil
 }
 
 func compareUpgrades(a, b *chantypes.QueryUpgradeResponse) bool {
@@ -707,14 +793,9 @@ func compareUpgrades(a, b *chantypes.QueryUpgradeResponse) bool {
 
 func upgradeAlreadyComplete(
 	channel *chantypes.QueryChannelResponse,
-	cpCtx QueryContext,
-	cp *ProvableChain,
 	cpChanUpg *chantypes.QueryUpgradeResponse,
+	proposedConnectionID string,
 ) (bool, error) {
-	proposedConnectionID, err := queryProposedConnectionID(cpCtx, cp, cpChanUpg)
-	if err != nil {
-		return false, err
-	}
 	result := channel.Channel.Version == cpChanUpg.Upgrade.Fields.Version &&
 		channel.Channel.Ordering == cpChanUpg.Upgrade.Fields.Ordering &&
 		channel.Channel.ConnectionHops[0] == proposedConnectionID
@@ -745,15 +826,13 @@ func buildActionMsg(
 	cp *ProvableChain,
 	cpChan *chantypes.QueryChannelResponse,
 	cpUpg *chantypes.QueryUpgradeResponse,
+	proposedConnectionID string,
+	cpDefaultUpgErr *chantypes.QueryUpgradeErrorResponse,
 ) (sdk.Msg, error) {
 	pathEnd := chain.Path()
 
 	switch action {
 	case UPGRADE_ACTION_TRY:
-		proposedConnectionID, err := queryProposedConnectionID(cpCtx, cp, cpUpg)
-		if err != nil {
-			return nil, err
-		}
 		return pathEnd.ChanUpgradeTry(proposedConnectionID, cpChan, cpUpg, addr), nil
 	case UPGRADE_ACTION_ACK:
 		return pathEnd.ChanUpgradeAck(cpChan, cpUpg, addr), nil
@@ -762,7 +841,7 @@ func buildActionMsg(
 	case UPGRADE_ACTION_OPEN:
 		return pathEnd.ChanUpgradeOpen(cpChan, addr), nil
 	case UPGRADE_ACTION_CANCEL:
-		upgErr, err := QueryChannelUpgradeError(cpCtx, cp, true)
+		upgErr, err := QueryChannelUpgradeError(cpCtx, cp, true, cpDefaultUpgErr)
 		if err != nil {
 			return nil, err
 		} else if upgErr == nil {
@@ -773,7 +852,7 @@ func buildActionMsg(
 		}
 		return pathEnd.ChanUpgradeCancel(upgErr, addr), nil
 	case UPGRADE_ACTION_CANCEL_FLUSHCOMPLETE:
-		upgErr, err := QueryChannelUpgradeError(cpCtx, cp, true)
+		upgErr, err := QueryChannelUpgradeError(cpCtx, cp, true, cpDefaultUpgErr)
 		if err != nil {
 			return nil, err
 		} else if upgErr == nil {
